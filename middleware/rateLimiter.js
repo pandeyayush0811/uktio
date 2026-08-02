@@ -21,4 +21,16 @@ const authLimiter = rateLimit({
   message: { error: 'Too many auth attempts, please try again later.' }
 });
 
-module.exports = { generalLimiter, authLimiter };
+// Writes (chat session saves, profile/onboarding updates) — tighter than
+// the general limiter. These touch the database and, once the analysis
+// LLM feature ships, some of these will trigger paid API calls — this
+// limiter is the first line of defense against a script hammering them.
+const writeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please slow down.' }
+});
+
+module.exports = { generalLimiter, authLimiter, writeLimiter };

@@ -160,3 +160,4 @@ router.get('/me', requireAuth, async (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.buildProfileUpdate = buildProfileUpdate; // exported for tests only

@@ -134,4 +134,19 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Called from Settings -> "Clear all chat history". Deletes every session
+// for this user; chat_messages cascade-delete automatically (foreign key
+// has ON DELETE CASCADE), so we only need to touch chat_sessions here.
+router.delete('/sessions', requireAuth, async (req, res, next) => {
+  try {
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+
+    const { error } = await supabaseAdmin.from('chat_sessions').delete().eq('user_id', req.user.id);
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
+module.exports.validateMessages = validateMessages; // exported for tests only
