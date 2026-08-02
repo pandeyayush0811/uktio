@@ -20,6 +20,53 @@ create table if not exists profiles (
   onboarding_completed boolean not null default false
 );
 
+-- Chat history: one row per completed voice session, plus one row per
+-- turn inside it. Frontend writes turns to local storage during the
+-- session and pushes everything here in a single call once it ends
+-- (see POST /chat/sessions) — so these tables only ever get one bulk
+-- insert per session, not one write per turn.
+create table if not exists chat_sessions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles(id) on delete cascade,
+  started_at timestamptz not null,
+  ended_at timestamptz not null,
+  turn_count int not null default 0,
+  created_at timestamptz default now()
+);
+
+create table if not exists chat_messages (
+  id uuid primary key default gen_random_uuid(),
+  session_id uuid not null references chat_sessions(id) on delete cascade,
+  role text not null check (role in ('user','assistant')),
+  content text not null,
+  turn_index int not null,
+  created_at timestamptz default now()
+);
+
+create index if not exists chat_messages_session_id_idx on chat_messages(session_id);
+create index if not exists chat_sessions_user_id_idx on chat_sessions(user_id);
+
+alter table chat_sessions enable row level security;
+alter table chat_messages enable row level security;
+
+drop policy if exists "Users can view own chat sessions" on chat_sessions;
+create policy "Users can view own chat sessions"
+  on chat_sessions for select
+  using (auth.uid() = user_id);
+
+drop policy if exists "Users can view own chat messages" on chat_messages;
+create policy "Users can view own chat messages"
+  on chat_messages for select
+  using (exists (
+    select 1 from chat_sessions
+    where chat_sessions.id = chat_messages.session_id
+    and chat_sessions.user_id = auth.uid()
+  ));
+-- No insert/update policies for regular users — all writes to these
+-- tables go through the backend's admin/service-role client (POST
+-- /chat/sessions), which bypasses RLS. This keeps the write path
+-- validated server-side instead of trusting the client directly.
+
 -- Safe to run again on an existing table — adds columns only if missing.
 alter table profiles add column if not exists name text;
 alter table profiles add column if not exists age int;

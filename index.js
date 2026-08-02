@@ -16,6 +16,7 @@ const { generalLimiter, authLimiter } = require('./middleware/rateLimiter');
 const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
+const chatRoutes = require('./routes/chatRoutes');
 
 const app = express();
 app.use(cors());
@@ -27,6 +28,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISO
 
 app.use('/auth', authLimiter, authRoutes);
 app.use('/users', userRoutes);
+app.use('/chat', chatRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
