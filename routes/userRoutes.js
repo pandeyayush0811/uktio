@@ -3,10 +3,11 @@ const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../lib/supabaseClient');
 
-// Allowed goal / level / time values — keeps bad data out of the DB.
+// Allowed goal / level / time / occupation values — keeps bad data out of the DB.
 const VALID_GOALS = ['interview', 'daily_confidence', 'exam_prep', 'travel', 'content_creation', 'general'];
 const VALID_LEVELS = ['beginner', 'intermediate', 'advanced'];
 const VALID_TIMES = ['5_10', '15_20', '30_plus'];
+const VALID_OCCUPATIONS = ['student', 'professional'];
 
 // Called once, right after signup, from the mandatory onboarding screen.
 // Saves the collected profile info and flips onboarding_completed to true.
@@ -16,11 +17,27 @@ router.post('/onboarding', requireAuth, async (req, res, next) => {
       return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
     }
 
-    const { name, age_or_class, city, goal, self_level, english_sample, daily_time } = req.body;
+    const { name, age, occupation_type, class_grade, profession, city, goal, self_level, english_sample, daily_time } = req.body;
 
     if (!name || !String(name).trim()) {
       return res.status(400).json({ error: 'name is required' });
     }
+
+    const ageNum = Number(age);
+    if (!age || !Number.isInteger(ageNum) || ageNum < 5 || ageNum > 100) {
+      return res.status(400).json({ error: 'age must be a whole number between 5 and 100' });
+    }
+
+    if (!occupation_type || !VALID_OCCUPATIONS.includes(occupation_type)) {
+      return res.status(400).json({ error: `occupation_type must be one of: ${VALID_OCCUPATIONS.join(', ')}` });
+    }
+    if (occupation_type === 'student' && (!class_grade || !String(class_grade).trim())) {
+      return res.status(400).json({ error: 'class_grade is required when occupation_type is student' });
+    }
+    if (occupation_type === 'professional' && (!profession || !String(profession).trim())) {
+      return res.status(400).json({ error: 'profession is required when occupation_type is professional' });
+    }
+
     if (!goal || !VALID_GOALS.includes(goal)) {
       return res.status(400).json({ error: `goal must be one of: ${VALID_GOALS.join(', ')}` });
     }
@@ -35,7 +52,10 @@ router.post('/onboarding', requireAuth, async (req, res, next) => {
       .from('profiles')
       .update({
         name: String(name).trim(),
-        age_or_class: age_or_class ? String(age_or_class).trim() : null,
+        age: ageNum,
+        occupation_type,
+        class_grade: occupation_type === 'student' ? String(class_grade).trim() : null,
+        profession: occupation_type === 'professional' ? String(profession).trim() : null,
         city: city ? String(city).trim() : null,
         goal,
         self_level,
