@@ -3,6 +3,10 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 
+const liteRoutes = require('./routes/liteRoutes');
+// ...
+app.use('/lite', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), liteRoutes);
+
 // Fail fast with a clear message instead of a confusing crash later.
 const requiredEnv = ['SUPABASE_URL', 'SUPABASE_ANON_KEY'];
 for (const key of requiredEnv) {
@@ -38,7 +42,7 @@ const chatRoutes = require('./routes/chatRoutes');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' })); // was: app.use(express.json());
 app.use(morgan('combined'));
 app.use(generalLimiter);
 
