@@ -2,6 +2,9 @@ const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../lib/supabaseClient');
+const { GoogleGenAI, Type } = require('@google/genai');
+
+const MIN_TURNS_FOR_ANALYSIS = 10; // matches the frontend's button-enable threshold
 
 const MAX_MESSAGES_PER_SESSION = 500; // sanity cap — a normal session is a few dozen turns
 
@@ -30,7 +33,18 @@ router.get('/sessions', requireAuth, async (req, res, next) => {
       .order('started_at', { ascending: false });
 
     if (error) return res.status(500).json({ error: error.message });
-    res.json({ sessions: data });
+
+    // One extra lightweight query to know which sessions already have a
+    // report — avoids an N+1 (one report-check call per card) on the
+    // History page.
+    const { data: reportRows } = await supabaseAdmin
+      .from('session_reports')
+      .select('session_id')
+      .eq('user_id', req.user.id);
+    const reportedIds = new Set((reportRows || []).map(r => r.session_id));
+
+    const sessions = data.map(s => ({ ...s, has_report: reportedIds.has(s.id) }));
+    res.json({ sessions });
   } catch (err) { next(err); }
 });
 
@@ -145,6 +159,159 @@ router.delete('/sessions', requireAuth, async (req, res, next) => {
     if (error) return res.status(500).json({ error: error.message });
 
     res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// Response schema Gemini must conform to — structured output means no
+// parsing guesswork and no risk of the model wandering into free-form
+// prose that's hard to render or reason about safely.
+const ANALYSIS_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    summary: { type: Type.STRING },
+    strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+    mistakes: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          explanation: { type: Type.STRING },
+          examples: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: { wrong: { type: Type.STRING }, right: { type: Type.STRING } },
+              required: ['wrong', 'right']
+            }
+          }
+        },
+        required: ['title', 'explanation', 'examples']
+      }
+    },
+    practice_tip: { type: Type.STRING }
+  },
+  required: ['summary', 'strengths', 'mistakes', 'practice_tip']
+};
+
+const DEFAULT_ANALYSIS_PROMPT = 'You are a warm, encouraging English mentor. Analyze the USER\'s English only (ignore the assistant\'s lines) and return structured JSON matching the given schema.';
+
+// Fetch the editable prompt from prompt_configs — this is what lets you
+// tune the analysis behavior from the Supabase dashboard, no deploy needed.
+async function getAnalysisPrompt() {
+  if (!supabaseAdmin) return DEFAULT_ANALYSIS_PROMPT;
+  const { data, error } = await supabaseAdmin.from('prompt_configs').select('prompt').eq('key', 'chat_analysis').single();
+  if (error || !data) return DEFAULT_ANALYSIS_PROMPT;
+  return data.prompt;
+}
+
+// Returns the existing report for a session, if one has been generated.
+// 404 (not 200 with null) if none exists — the frontend uses this to
+// decide whether to show "See report" or "Generate report".
+router.get('/sessions/:id/report', requireAuth, async (req, res, next) => {
+  try {
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+
+    const { data, error } = await supabaseAdmin
+      .from('session_reports')
+      .select('id, session_id, summary, strengths, mistakes, practice_tip, generated_at')
+      .eq('session_id', req.params.id)
+      .eq('user_id', req.user.id) // ownership check
+      .single();
+
+    if (error || !data) return res.status(404).json({ error: 'No report yet for this session.' });
+    res.json({ report: data });
+  } catch (err) { next(err); }
+});
+
+// Generates (or returns the already-generated) report for one session.
+// Synchronous — a single transcript is small enough that this finishes
+// in a few seconds, so no job queue/polling is needed for this feature.
+router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
+  try {
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: 'Server misconfigured: GEMINI_API_KEY missing.' });
+
+    const sessionId = req.params.id;
+
+    // Idempotent: if a report already exists, just return it instead of
+    // burning another paid API call (also enforced by the DB's unique
+    // constraint on session_id, this is just the friendly fast-path).
+    const { data: existing } = await supabaseAdmin
+      .from('session_reports')
+      .select('id, session_id, summary, strengths, mistakes, practice_tip, generated_at')
+      .eq('session_id', sessionId)
+      .eq('user_id', req.user.id)
+      .single();
+    if (existing) return res.json({ report: existing, already_existed: true });
+
+    // Ownership + fetch messages.
+    const { data: session, error: sessionErr } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('id, turn_count')
+      .eq('id', sessionId)
+      .eq('user_id', req.user.id)
+      .single();
+    if (sessionErr || !session) return res.status(404).json({ error: 'Session not found' });
+
+    if (session.turn_count < MIN_TURNS_FOR_ANALYSIS) {
+      return res.status(400).json({ error: `Session needs at least ${MIN_TURNS_FOR_ANALYSIS} turns to analyze (has ${session.turn_count}).` });
+    }
+
+    const { data: messages, error: messagesErr } = await supabaseAdmin
+      .from('chat_messages')
+      .select('role, content, turn_index')
+      .eq('session_id', sessionId)
+      .order('turn_index', { ascending: true });
+    if (messagesErr) return res.status(500).json({ error: messagesErr.message });
+
+    const transcript = messages.map(m => (m.role === 'user' ? 'User' : 'Bolo') + ': ' + m.content).join('\n');
+    const systemPrompt = await getAnalysisPrompt();
+
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    const model = 'gemini-2.5-pro';
+
+    let parsed;
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: transcript,
+        config: { systemInstruction: systemPrompt, responseMimeType: 'application/json', responseSchema: ANALYSIS_SCHEMA }
+      });
+      parsed = JSON.parse(response.text);
+    } catch (aiErr) {
+      console.error('Analysis LLM call failed:', aiErr);
+      return res.status(502).json({ error: 'Analysis failed — please try again.' });
+    }
+
+    // Defensive validation — never trust model output blindly, even with
+    // a schema. Cap array sizes so one weird response can't bloat the DB.
+    const safeReport = {
+      session_id: sessionId,
+      user_id: req.user.id,
+      summary: typeof parsed.summary === 'string' ? parsed.summary.slice(0, 4000) : '',
+      strengths: Array.isArray(parsed.strengths) ? parsed.strengths.slice(0, 15).map(s => String(s).slice(0, 300)) : [],
+      mistakes: Array.isArray(parsed.mistakes) ? parsed.mistakes.slice(0, 20).map(m => ({
+        title: String(m.title || '').slice(0, 200),
+        explanation: String(m.explanation || '').slice(0, 1500),
+        examples: Array.isArray(m.examples) ? m.examples.slice(0, 6).map(e => ({
+          wrong: String(e.wrong || '').slice(0, 400),
+          right: String(e.right || '').slice(0, 400)
+        })) : []
+      })) : [],
+      practice_tip: typeof parsed.practice_tip === 'string' ? parsed.practice_tip.slice(0, 1000) : '',
+      model_version: model,
+      raw_response: parsed
+    };
+
+    const { data: saved, error: saveErr } = await supabaseAdmin
+      .from('session_reports')
+      .insert(safeReport)
+      .select('id, session_id, summary, strengths, mistakes, practice_tip, generated_at')
+      .single();
+
+    if (saveErr) return res.status(500).json({ error: saveErr.message });
+    res.json({ report: saved, already_existed: false });
   } catch (err) { next(err); }
 });
 

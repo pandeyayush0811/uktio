@@ -62,10 +62,60 @@ create policy "Users can view own chat messages"
     where chat_sessions.id = chat_messages.session_id
     and chat_sessions.user_id = auth.uid()
   ));
--- No insert/update policies for regular users — all writes to these
--- tables go through the backend's admin/service-role client (POST
--- /chat/sessions), which bypasses RLS. This keeps the write path
--- validated server-side instead of trusting the client directly.
+-- Editable system prompts — lets you tune the analysis LLM's behavior
+-- from the Supabase dashboard directly, without a code deploy.
+create table if not exists prompt_configs (
+  key text primary key,
+  prompt text not null,
+  updated_at timestamptz default now()
+);
+
+insert into prompt_configs (key, prompt) values (
+  'chat_analysis',
+  'Tum ek warm, caring English mentor ho jo ek user aur unke AI voice-practice companion "Bolo" ke beech hui conversation transcript padhte ho. Tumhara kaam hai USER (sirf "user" role wale messages, "assistant" ke nahi) ki English ko dekhna aur unhe ek naturally likha hua, insaan-jaisa report dena — bilkul kisi caring senior ya dost ki tarah, kisi automated "test result" ya formal report card ki tarah bilkul nahi.
+
+ZAROORI: Ye transcript ek VOICE app se aayi hai jahan speech-to-text transcription hui hai — kabhi kabhi transcription hi galat/garbled ho jaati hai (jaise random words, adhoore sentences, ajeeb spellings jo user ne bola hi nahi hoga). Apni samajh se pehchano ki kya cheez genuine English mistake hai aur kya sirf transcription ka glitch hai — agar kuch clearly transcription error lagta hai (matlab hi nahi banta context mein), usse mistake mat maano, use ignore kar do.
+
+Explanation ka style: itna simple likho ki ek 12 saal ka baccha bhi samajh jaaye — koi heavy grammar terminology (jaise "past perfect continuous") mat use karo bina simple tareeke se samjhaye. Jargon-free, warm, encouraging tone rakho.
+
+Har genuine mistake ke liye: user ne jo actually kaha uske jaisa hi topic/style rakhte hue 3-4 additional example sentences do (correct version ke saath) — taaki user ko practice ke liye real, relatable examples milein, generic textbook examples nahi.
+
+Report lamba ho sakta hai, koi problem nahi — thoroughness zaroori hai, brevity nahi.
+
+Structured JSON format mein hi respond karo, jo schema diya gaya hai usी ke according.'
+) on conflict (key) do nothing;
+
+-- RLS enabled, deliberately with NO policy for normal users. Without
+-- this, the anon key (which ships publicly in config.js) could read
+-- this table directly via the REST API — leaking the internal AI
+-- prompt. Zero policies = deny-by-default; only the backend's
+-- service-role client (which bypasses RLS entirely) can read it.
+alter table prompt_configs enable row level security;
+
+-- One report per chat session (enforced by the unique constraint on
+-- session_id) — matches the product decision that a session gets
+-- analyzed once, on demand, not regenerated automatically.
+create table if not exists session_reports (
+  id uuid primary key default gen_random_uuid(),
+  session_id uuid not null unique references chat_sessions(id) on delete cascade,
+  user_id uuid not null references profiles(id) on delete cascade,
+  summary text,
+  strengths jsonb,       -- string[]
+  mistakes jsonb,        -- [{ title, explanation, examples: [{wrong, right}] }]
+  practice_tip text,
+  model_version text,
+  raw_response jsonb,    -- full original model output, kept for debugging/audit only
+  generated_at timestamptz default now()
+);
+
+create index if not exists session_reports_user_id_idx on session_reports(user_id);
+
+alter table session_reports enable row level security;
+drop policy if exists "Users can view own reports" on session_reports;
+create policy "Users can view own reports"
+  on session_reports for select
+  using (auth.uid() = user_id);
+-- No insert/update policy — only the backend's admin client writes here.
 
 -- Safe to run again on an existing table — adds columns only if missing.
 alter table profiles add column if not exists name text;
