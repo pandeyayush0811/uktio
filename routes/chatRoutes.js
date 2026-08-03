@@ -166,10 +166,13 @@ router.delete('/sessions', requireAuth, async (req, res, next) => {
 // parsing guesswork and no risk of the model wandering into free-form
 // prose that's hard to render or reason about safely.
 // (Plain JSON Schema, used with OpenAI's response_format: json_schema.)
+// NOTE: this must stay in lockstep with the `chat_analysis` prompt in
+// prompt_configs — if you change the prompt's expected fields, update
+// this schema (and the safeReport sanitizer + SQL columns below) too.
 const ANALYSIS_SCHEMA = {
   type: 'object',
   properties: {
-    summary: { type: 'string' },
+    opening_line: { type: 'string' },
     strengths: { type: 'array', items: { type: 'string' } },
     mistakes: {
       type: 'array',
@@ -177,27 +180,36 @@ const ANALYSIS_SCHEMA = {
         type: 'object',
         properties: {
           title: { type: 'string' },
-          explanation: { type: 'string' },
+          occurred_count: { type: 'integer' },
+          context: { type: 'string' },
+          reason: { type: 'string' },
           examples: {
             type: 'array',
             items: {
               type: 'object',
-              properties: { wrong: { type: 'string' }, right: { type: 'string' } },
-              required: ['wrong', 'right'],
+              properties: {
+                hindi: { type: 'string' },
+                wrong_english: { type: 'string' },
+                correct_english: { type: 'string' }
+              },
+              required: ['hindi', 'wrong_english', 'correct_english'],
               additionalProperties: false
             }
           }
         },
-        required: ['title', 'explanation', 'examples'],
+        required: ['title', 'occurred_count', 'context', 'reason', 'examples'],
         additionalProperties: false
       }
     },
-    practice_tip: { type: 'string' }
+    growth_note: { type: 'string' },
+    focus_next: { type: 'string' }
   },
-  required: ['summary', 'strengths', 'mistakes', 'practice_tip'],
+  required: ['opening_line', 'strengths', 'mistakes', 'growth_note', 'focus_next'],
   additionalProperties: false
 };
 
+// Only used if prompt_configs is unreachable/misconfigured — the real
+// prompt always comes from the DB (see getAnalysisPrompt below).
 const DEFAULT_ANALYSIS_PROMPT = 'You are a warm, encouraging English mentor. Analyze the USER\'s English only (ignore the assistant\'s lines) and return structured JSON matching the given schema.';
 
 // Folds the user's profile (name/age/occupation/city/goal/level) into the
@@ -230,6 +242,10 @@ async function getAnalysisPrompt() {
   return data.prompt;
 }
 
+// Columns for the new report shape — kept in one place so the idempotent
+// fast-path and the GET route can't drift apart.
+const REPORT_COLUMNS = 'id, session_id, opening_line, strengths, mistakes, growth_note, focus_next, generated_at';
+
 // Returns the existing report for a session, if one has been generated.
 // 404 (not 200 with null) if none exists — the frontend uses this to
 // decide whether to show "See report" or "Generate report".
@@ -239,7 +255,7 @@ router.get('/sessions/:id/report', requireAuth, async (req, res, next) => {
 
     const { data, error } = await supabaseAdmin
       .from('session_reports')
-      .select('id, session_id, summary, strengths, mistakes, practice_tip, generated_at')
+      .select(REPORT_COLUMNS)
       .eq('session_id', req.params.id)
       .eq('user_id', req.user.id) // ownership check
       .single();
@@ -264,7 +280,7 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
     // constraint on session_id, this is just the friendly fast-path).
     const { data: existing } = await supabaseAdmin
       .from('session_reports')
-      .select('id, session_id, summary, strengths, mistakes, practice_tip, generated_at')
+      .select(REPORT_COLUMNS)
       .eq('session_id', sessionId)
       .eq('user_id', req.user.id)
       .single();
@@ -304,7 +320,7 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
     const systemPrompt = (await getAnalysisPrompt()) + buildPersonalizationBlock(profile);
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const model = 'gpt-4o-mini'; // swap for 'gpt-4o' or another chat model if you want higher quality
+    const model = 'gpt-4.1'; // swap for 'gpt-4o' or another chat model if you want higher quality
 
     let parsed;
     try {
@@ -326,21 +342,26 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
     }
 
     // Defensive validation — never trust model output blindly, even with
-    // a schema. Cap array sizes so one weird response can't bloat the DB.
+    // a schema. Cap array/string sizes so one weird response can't bloat
+    // the DB. Field names here MUST match ANALYSIS_SCHEMA above.
     const safeReport = {
       session_id: sessionId,
       user_id: req.user.id,
-      summary: typeof parsed.summary === 'string' ? parsed.summary.slice(0, 4000) : '',
+      opening_line: typeof parsed.opening_line === 'string' ? parsed.opening_line.slice(0, 500) : '',
       strengths: Array.isArray(parsed.strengths) ? parsed.strengths.slice(0, 15).map(s => String(s).slice(0, 300)) : [],
       mistakes: Array.isArray(parsed.mistakes) ? parsed.mistakes.slice(0, 20).map(m => ({
         title: String(m.title || '').slice(0, 200),
-        explanation: String(m.explanation || '').slice(0, 1500),
-        examples: Array.isArray(m.examples) ? m.examples.slice(0, 6).map(e => ({
-          wrong: String(e.wrong || '').slice(0, 400),
-          right: String(e.right || '').slice(0, 400)
+        occurred_count: Number.isInteger(m.occurred_count) && m.occurred_count >= 0 ? m.occurred_count : 1,
+        context: String(m.context || '').slice(0, 1000),
+        reason: String(m.reason || '').slice(0, 500),
+        examples: Array.isArray(m.examples) ? m.examples.slice(0, 3).map(e => ({
+          hindi: String(e.hindi || '').slice(0, 400),
+          wrong_english: String(e.wrong_english || '').slice(0, 400),
+          correct_english: String(e.correct_english || '').slice(0, 400)
         })) : []
       })) : [],
-      practice_tip: typeof parsed.practice_tip === 'string' ? parsed.practice_tip.slice(0, 1000) : '',
+      growth_note: typeof parsed.growth_note === 'string' ? parsed.growth_note.slice(0, 1000) : '',
+      focus_next: typeof parsed.focus_next === 'string' ? parsed.focus_next.slice(0, 1000) : '',
       model_version: model,
       raw_response: parsed
     };
@@ -348,7 +369,7 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
     const { data: saved, error: saveErr } = await supabaseAdmin
       .from('session_reports')
       .insert(safeReport)
-      .select('id, session_id, summary, strengths, mistakes, practice_tip, generated_at')
+      .select(REPORT_COLUMNS)
       .single();
 
     if (saveErr) return res.status(500).json({ error: saveErr.message });
