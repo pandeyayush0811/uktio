@@ -200,6 +200,27 @@ const ANALYSIS_SCHEMA = {
 
 const DEFAULT_ANALYSIS_PROMPT = 'You are a warm, encouraging English mentor. Analyze the USER\'s English only (ignore the assistant\'s lines) and return structured JSON matching the given schema.';
 
+// Folds the user's profile (name/age/occupation/city/goal/level) into the
+// analysis prompt, so the report is anchored to WHO this person is, not
+// just what they happened to say in one session — same principle as the
+// live chat persona's personalization block.
+function buildPersonalizationBlock(profile) {
+  if (!profile) return '';
+  const lines = [];
+  if (profile.name) lines.push(`User ka naam "${profile.name}" hai — report ke andar unhe naam se hi address karo, generic "aap/user" jaisa mat likho.`);
+  if (profile.age) lines.push(`Age: ${profile.age} saal.`);
+  if (profile.occupation_type === 'student' && profile.class_grade) {
+    lines.push(`Student hai, "${profile.class_grade}" mein padhta/padhti hai.`);
+  } else if (profile.occupation_type === 'professional' && profile.profession) {
+    lines.push(`Working professional hai — role: "${profile.profession}".`);
+  }
+  if (profile.city) lines.push(`Shehar: "${profile.city}".`);
+  if (profile.goal) lines.push(`English seekhne ka goal: "${profile.goal}".`);
+  if (profile.self_level) lines.push(`Khud-bataya level: "${profile.self_level}".`);
+  if (!lines.length) return '';
+  return '\n\n═══════════════════════════════\nUSER KE BAARE MEIN — isko dhyan mein rakh ke report likho, jaise ek mentor apne student ko personally jaanta ho\n═══════════════════════════════\n\n' + lines.join('\n');
+}
+
 // Fetch the editable prompt from prompt_configs — this is what lets you
 // tune the analysis behavior from the Supabase dashboard, no deploy needed.
 async function getAnalysisPrompt() {
@@ -262,6 +283,16 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
       return res.status(400).json({ error: `Session needs at least ${MIN_TURNS_FOR_ANALYSIS} turns to analyze (has ${session.turn_count}).` });
     }
 
+    // Fetch user's profile — report ko sirf transcript se nahi, balki YE
+    // user kaun hai (naam/age/profession/city/goal) usse bhi personalize
+    // karna hai, bilkul waise hi jaise live chat persona ko bhi profile
+    // pata hota hai.
+    const { data: profile } = await supabaseAdmin
+      .from('profiles')
+      .select('name, age, occupation_type, class_grade, profession, city, goal, self_level')
+      .eq('id', req.user.id)
+      .single();
+
     const { data: messages, error: messagesErr } = await supabaseAdmin
       .from('chat_messages')
       .select('role, content, turn_index')
@@ -270,7 +301,7 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
     if (messagesErr) return res.status(500).json({ error: messagesErr.message });
 
     const transcript = messages.map(m => (m.role === 'user' ? 'User' : 'Bolo') + ': ' + m.content).join('\n');
-    const systemPrompt = await getAnalysisPrompt();
+    const systemPrompt = (await getAnalysisPrompt()) + buildPersonalizationBlock(profile);
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const model = 'gpt-4o-mini'; // swap for 'gpt-4o' or another chat model if you want higher quality
