@@ -76,4 +76,23 @@ router.post('/logout', (req, res) => {
   res.json({ message: 'Logged out.' });
 });
 
+// Called by the frontend when the access token is close to expiring (or
+// already has). Exchanges the long-lived refresh_token for a brand new
+// access_token + refresh_token pair — this is what keeps a user logged
+// in for weeks/months instead of getting silently logged out every hour
+// (Supabase access tokens expire after 1 hour by default).
+router.post('/refresh', async (req, res, next) => {
+  try {
+    const { refresh_token } = req.body;
+    if (!refresh_token) return res.status(400).json({ error: 'refresh_token is required' });
+
+    const { data, error } = await supabaseAnon.auth.refreshSession({ refresh_token });
+    if (error || !data.session) {
+      return res.status(401).json({ error: error ? error.message : 'Refresh failed' });
+    }
+
+    res.json({ session: data.session });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
