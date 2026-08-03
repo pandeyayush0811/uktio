@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../lib/supabaseClient');
-const { GoogleGenAI, Type } = require('@google/genai');
+const OpenAI = require('openai');
 
 const MIN_TURNS_FOR_ANALYSIS = 10; // matches the frontend's button-enable threshold
 
@@ -162,36 +162,40 @@ router.delete('/sessions', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Response schema Gemini must conform to — structured output means no
+// Response schema the model must conform to — structured output means no
 // parsing guesswork and no risk of the model wandering into free-form
 // prose that's hard to render or reason about safely.
+// (Plain JSON Schema, used with OpenAI's response_format: json_schema.)
 const ANALYSIS_SCHEMA = {
-  type: Type.OBJECT,
+  type: 'object',
   properties: {
-    summary: { type: Type.STRING },
-    strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+    summary: { type: 'string' },
+    strengths: { type: 'array', items: { type: 'string' } },
     mistakes: {
-      type: Type.ARRAY,
+      type: 'array',
       items: {
-        type: Type.OBJECT,
+        type: 'object',
         properties: {
-          title: { type: Type.STRING },
-          explanation: { type: Type.STRING },
+          title: { type: 'string' },
+          explanation: { type: 'string' },
           examples: {
-            type: Type.ARRAY,
+            type: 'array',
             items: {
-              type: Type.OBJECT,
-              properties: { wrong: { type: Type.STRING }, right: { type: Type.STRING } },
-              required: ['wrong', 'right']
+              type: 'object',
+              properties: { wrong: { type: 'string' }, right: { type: 'string' } },
+              required: ['wrong', 'right'],
+              additionalProperties: false
             }
           }
         },
-        required: ['title', 'explanation', 'examples']
+        required: ['title', 'explanation', 'examples'],
+        additionalProperties: false
       }
     },
-    practice_tip: { type: Type.STRING }
+    practice_tip: { type: 'string' }
   },
-  required: ['summary', 'strengths', 'mistakes', 'practice_tip']
+  required: ['summary', 'strengths', 'mistakes', 'practice_tip'],
+  additionalProperties: false
 };
 
 const DEFAULT_ANALYSIS_PROMPT = 'You are a warm, encouraging English mentor. Analyze the USER\'s English only (ignore the assistant\'s lines) and return structured JSON matching the given schema.';
@@ -230,7 +234,7 @@ router.get('/sessions/:id/report', requireAuth, async (req, res, next) => {
 router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
   try {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
-    if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: 'Server misconfigured: GEMINI_API_KEY missing.' });
+    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'Server misconfigured: OPENAI_API_KEY missing.' });
 
     const sessionId = req.params.id;
 
@@ -268,17 +272,23 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
     const transcript = messages.map(m => (m.role === 'user' ? 'User' : 'Bolo') + ': ' + m.content).join('\n');
     const systemPrompt = await getAnalysisPrompt();
 
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    const model = 'gemini-2.5-pro';
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const model = 'gpt-4o-mini'; // swap for 'gpt-4o' or another chat model if you want higher quality
 
     let parsed;
     try {
-      const response = await ai.models.generateContent({
+      const response = await openai.chat.completions.create({
         model,
-        contents: transcript,
-        config: { systemInstruction: systemPrompt, responseMimeType: 'application/json', responseSchema: ANALYSIS_SCHEMA }
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: transcript }
+        ],
+        response_format: {
+          type: 'json_schema',
+          json_schema: { name: 'analysis_report', schema: ANALYSIS_SCHEMA, strict: true }
+        }
       });
-      parsed = JSON.parse(response.text);
+      parsed = JSON.parse(response.choices[0].message.content);
     } catch (aiErr) {
       console.error('Analysis LLM call failed:', aiErr);
       return res.status(502).json({ error: 'Analysis failed — please try again.' });

@@ -9,13 +9,13 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "@google/genai": "^2.15.0",
     "@sentry/node": "^10.69.0",
     "@supabase/supabase-js": "^2.45.0",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
-    "morgan": "^1.10.0"
+    "morgan": "^1.10.0",
+    "openai": "^4.79.0"
   }
 }
