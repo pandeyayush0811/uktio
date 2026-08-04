@@ -20,9 +20,15 @@ const { transcribeAudio } = require('../lib/lite/sarvamSttClient');
 const { streamReply } = require('../lib/lite/llmClient');
 const { synthesizeSpeech } = require('../lib/lite/sarvamTtsClient');
 
-// How many past turns get fed back as context on each new turn — keeps
-// LLM cost/latency bounded even in a long practice session.
-const MAX_TURNS_CONTEXT = 20;
+// How many past turns get fed back as context on each new turn — kept
+// deliberately small. This is a quick-practice chat, not a long-term
+// memory app: the last few exchanges are enough for natural flow and
+// for the model to notice a repeated mistake (see REPETITION-BASED
+// INTENSITY in llmClient.js's prompt), and every turn beyond this is
+// pure token cost + latency with no real benefit. Tuned down from an
+// earlier 20 after discussion — 20 turns of history on every single
+// call was paying for context depth this feature doesn't need.
+const MAX_TURNS_CONTEXT = 10;
 
 // Starts a new lite session. Called once when the practice page opens.
 router.post('/sessions', requireAuth, async (req, res, next) => {
@@ -176,9 +182,9 @@ router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
     const ttsPromises = [];
     let replyText;
     try {
-      const result = await streamReply(history, userText, (sentence) => {
+      const result = await streamReply(history, userText, (sentence, lang) => {
         sentences.push(sentence);
-        ttsPromises.push(synthesizeSpeech(sentence).catch(err => {
+        ttsPromises.push(synthesizeSpeech(sentence, lang).catch(err => {
           console.error('Lite TTS sentence failed, skipping that chunk:', err);
           return null;
         }));
@@ -295,11 +301,11 @@ router.post('/sessions/:id/turn/stream', requireAuth, async (req, res, next) => 
     // the LLM stream keeps being read without stalling on network I/O.
     const ttsPromises = [];
     let sentenceCount = 0;
-    const onSentence = (sentence, index) => {
+    const onSentence = (sentence, lang, index) => {
       if (clientGone) return;
       send('reply_sentence', { index, text: sentence });
       ttsPromises.push(
-        synthesizeSpeech(sentence).catch(err => {
+        synthesizeSpeech(sentence, lang).catch(err => {
           console.error('Lite TTS (stream) sentence failed, skipping that chunk:', err);
           return null;
         })
@@ -332,6 +338,19 @@ router.post('/sessions/:id/turn/stream', requireAuth, async (req, res, next) => 
     }
     console.log(`[lite timing/stream] all audio chunks done: ${elapsed()}ms`);
 
+    // Deliberately still AWAITED, not fire-and-forget, even though this
+    // is the very last thing before the response closes: by this point
+    // the user already has all the text + audio they came for (both were
+    // streamed above), so this DB write no longer sits in front of
+    // anything they're watching/listening to — the only thing it delays
+    // is the mic re-enabling for their NEXT turn, typically well under
+    // 100-200ms. Not awaiting it would shave that sliver of time, but
+    // opens a real correctness gap: persistTurn also bumps
+    // session.turn_count, which the NEXT turn's history fetch and
+    // turn_index math both depend on. If the user somehow started a new
+    // turn before this write landed, that next turn could read a stale
+    // turn_count and collide on turn_index. Not a trade worth making for
+    // a race that's already rare and only saves ~100ms.
     try {
       await persistTurn(session, userText, replyText);
     } catch (e) {
