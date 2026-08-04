@@ -7,7 +7,7 @@ const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../lib/supabaseClient');
-const { transcribeAudio } = require('../lib/lite/sttClient');
+const { transcribeAudio } = require('../lib/lite/geminiSttClient');
 const { getReplyAndCorrections } = require('../lib/lite/llmClient');
 const { synthesizeSpeech } = require('../lib/lite/ttsClient');
 
