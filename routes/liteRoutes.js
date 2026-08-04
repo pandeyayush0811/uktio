@@ -2,51 +2,27 @@
 // Nothing in this file imports from chatRoutes.js, and chatRoutes.js
 // imports nothing from here. Delete this file + lib/lite/ + the lite_*
 // tables + the one mount line in index.js to remove the feature entirely.
+//
+// NOTE ON SCOPE: this feature is intentionally TEXT+VOICE conversation
+// only — no live mistake/correction analysis. That used to be bundled
+// into the same LLM call (a "mistakes" array alongside "reply"), but it
+// was pure latency/cost with no benefit to the live conversation itself,
+// so it's been removed from this hot path entirely. Grammar/correction
+// analysis is a separate future "report" feature: run it asynchronously,
+// after the fact, off the stored `lite_turns` transcript — never inline
+// with a turn the user is actively waiting on.
 
 const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../lib/supabaseClient');
 const { transcribeAudio } = require('../lib/lite/sarvamSttClient');
-const { getReplyAndCorrections } = require('../lib/lite/llmClient');
+const { streamReply } = require('../lib/lite/llmClient');
 const { synthesizeSpeech } = require('../lib/lite/sarvamTtsClient');
 
 // How many past turns get fed back as context on each new turn — keeps
 // LLM cost/latency bounded even in a long practice session.
 const MAX_TURNS_CONTEXT = 20;
-
-// Same safety net as the non-streaming route: bound how much text ever
-// reaches TTS, regardless of what the LLM decides to send back.
-const MAX_TTS_CHARS = 220; // ~2 short sentences of spoken English
-
-// Splits reply text into sentence-sized pieces for pipelined TTS — each
-// sentence gets synthesized (and streamed to the client) independently,
-// so audio can start playing after the FIRST sentence is ready instead
-// of waiting for the entire reply to finish synthesizing. Falls back to
-// treating the whole string as one "sentence" if no boundary is found
-// (e.g. a short reply with no punctuation).
-function splitIntoSentences(text) {
-  const trimmed = (text || '').trim();
-  if (!trimmed) return [];
-  const matches = trimmed.match(/[^.!?]+[.!?]+(\s+|$)/g);
-  const sentences = (matches && matches.length ? matches : [trimmed])
-    .map(s => s.trim())
-    .filter(Boolean);
-  return sentences.length ? sentences : [trimmed];
-}
-
-// Applies the same MAX_TTS_CHARS boundary as the non-streaming route,
-// but returns it as an array of sentences ready for pipelined TTS instead
-// of one big string.
-function capTextForTts(replyText) {
-  let capped = replyText;
-  if (capped.length > MAX_TTS_CHARS) {
-    const cut = capped.slice(0, MAX_TTS_CHARS);
-    const lastBoundary = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('? '), cut.lastIndexOf('! '));
-    capped = lastBoundary > 40 ? cut.slice(0, lastBoundary + 1) : cut;
-  }
-  return splitIntoSentences(capped);
-}
 
 // Starts a new lite session. Called once when the practice page opens.
 router.post('/sessions', requireAuth, async (req, res, next) => {
@@ -81,7 +57,7 @@ router.get('/sessions', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Full transcript for one session (with corrections attached to each reply).
+// Full transcript for one session.
 router.get('/sessions/:id', requireAuth, async (req, res, next) => {
   try {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured.' });
@@ -96,7 +72,7 @@ router.get('/sessions/:id', requireAuth, async (req, res, next) => {
 
     const { data: turns, error: turnsErr } = await supabaseAdmin
       .from('lite_turns')
-      .select('role, content, mistakes, turn_index')
+      .select('role, content, turn_index')
       .eq('session_id', req.params.id)
       .order('turn_index', { ascending: true });
     if (turnsErr) return res.status(500).json({ error: turnsErr.message });
@@ -117,7 +93,60 @@ router.delete('/sessions', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// THE CORE LOOP: one spoken turn in, one spoken (+ corrected) reply out.
+// Shared by both routes below: looks up the session (auth-scoped) and
+// kicks off STT + history-fetch in parallel, since neither depends on
+// the other. Throws a small typed error object on failure so each route
+// can translate it to its own response shape (JSON status vs SSE event).
+async function runSttAndHistory(sessionRowId, userId, audioBuffer, mimeType) {
+  const { data: session, error: sessionErr } = await supabaseAdmin
+    .from('lite_sessions')
+    .select('id, turn_count')
+    .eq('id', sessionRowId)
+    .eq('user_id', userId)
+    .single();
+  if (sessionErr || !session) throw { kind: 'not_found', message: 'Session not found' };
+
+  const historyPromise = supabaseAdmin
+    .from('lite_turns')
+    .select('role, content')
+    .eq('session_id', session.id)
+    .order('turn_index', { ascending: false })
+    .limit(MAX_TURNS_CONTEXT);
+
+  let userText, historyResult;
+  try {
+    [userText, historyResult] = await Promise.all([transcribeAudio(audioBuffer, mimeType), historyPromise]);
+  } catch (sttErr) {
+    console.error('Lite STT failed:', sttErr);
+    throw { kind: 'stt_failed', message: 'Transcription failed — please try again.' };
+  }
+  if (!userText) throw { kind: 'no_speech', message: 'Could not hear any speech — try again a bit louder/closer to mic.' };
+  if (historyResult.error) throw { kind: 'db_error', message: historyResult.error.message };
+
+  return { session, userText, history: (historyResult.data || []).reverse() };
+}
+
+// Persists both turns of the exchange (one bulk insert) + bumps the
+// session's turn_count/ended_at. Shared by both routes.
+async function persistTurn(session, userText, replyText) {
+  const startIndex = session.turn_count;
+  const rows = [
+    { session_id: session.id, role: 'user', content: userText, turn_index: startIndex },
+    { session_id: session.id, role: 'assistant', content: replyText, turn_index: startIndex + 1 }
+  ];
+  const { error: insertErr } = await supabaseAdmin.from('lite_turns').insert(rows);
+  if (insertErr) throw { kind: 'db_error', message: insertErr.message };
+
+  await supabaseAdmin
+    .from('lite_sessions')
+    .update({ ended_at: new Date().toISOString(), turn_count: startIndex + 2 })
+    .eq('id', session.id);
+}
+
+// THE CORE LOOP (blocking version) — kept for any caller that isn't set
+// up to consume a stream. Same underlying streamReply() as the /stream
+// route below, just buffered into one response instead of pushed
+// incrementally, so it's slower to FEEL, but does identical work.
 // Body: { audio_base64: string, mime_type: string }
 router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
   try {
@@ -127,158 +156,100 @@ router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
     if (!audio_base64 || typeof audio_base64 !== 'string') return res.status(400).json({ error: 'audio_base64 is required' });
     if (!mime_type || typeof mime_type !== 'string') return res.status(400).json({ error: 'mime_type is required' });
 
-    // TEMP TIMING INSTRUMENTATION — remove once we've identified the
-    // slow stage. Logs elapsed ms at each step so we can see exactly
-    // where the turn's time is going (network upload isn't included
-    // here — that happens before Express even sees the request — so
-    // compare this server-side total against what the client perceives).
     const t0 = Date.now();
     const elapsed = () => Date.now() - t0;
-    const timing = {};
 
-    const { data: session, error: sessionErr } = await supabaseAdmin
-      .from('lite_sessions')
-      .select('id, turn_count')
-      .eq('id', req.params.id)
-      .eq('user_id', req.user.id)
-      .single();
-    if (sessionErr || !session) return res.status(404).json({ error: 'Session not found' });
-    console.log(`[lite timing] session lookup done: ${elapsed()}ms`);
-    timing.session_lookup_ms = elapsed();
-
-    // 1. Speech -> text (Sarvam) AND 2. history fetch — run in parallel.
-    // These two don't depend on each other (history only needs session.id,
-    // not the transcribed text), so there's no reason to make one wait
-    // for the other. This alone saves the full history-fetch duration
-    // off the critical path (was ~100-300ms dead time before).
-    const audioBuffer = Buffer.from(audio_base64, 'base64');
-    const historyPromise = supabaseAdmin
-      .from('lite_turns')
-      .select('role, content')
-      .eq('session_id', session.id)
-      .order('turn_index', { ascending: false })
-      .limit(MAX_TURNS_CONTEXT);
-
-    let userText;
-    let historyRows, historyErr;
+    let session, userText, history;
     try {
-      const [sttResult, historyResult] = await Promise.all([
-        transcribeAudio(audioBuffer, mime_type),
-        historyPromise
-      ]);
-      userText = sttResult;
-      historyRows = historyResult.data;
-      historyErr = historyResult.error;
-    } catch (sttErr) {
-      console.error('Lite STT failed:', sttErr);
-      return res.status(502).json({ error: 'Transcription failed — please try again.' });
+      ({ session, userText, history } = await runSttAndHistory(req.params.id, req.user.id, Buffer.from(audio_base64, 'base64'), mime_type));
+    } catch (e) {
+      const status = e.kind === 'not_found' ? 404 : e.kind === 'no_speech' ? 422 : 500;
+      return res.status(status).json({ error: e.message });
     }
-    console.log(`[lite timing] STT + history (parallel) done: ${elapsed()}ms`);
-    timing.stt_ms = elapsed();
-    if (!userText) return res.status(422).json({ error: 'Could not hear any speech — try again a bit louder/closer to mic.' });
-    if (historyErr) return res.status(500).json({ error: historyErr.message });
-    const history = (historyRows || []).reverse();
-    timing.history_fetch_ms = elapsed(); // now effectively free — ran alongside STT
+    console.log(`[lite timing] STT + history done: ${elapsed()}ms`);
 
-    // 3. Text reply + inline correction (OpenAI GPT-4.1)
-    let parsed;
+    // Collect sentences as they stream in, kicking off TTS for each
+    // immediately (don't wait for the full reply before starting audio
+    // synthesis) — even in the "blocking" route, there's no reason to
+    // pay that time serially.
+    const sentences = [];
+    const ttsPromises = [];
+    let replyText;
     try {
-      parsed = await getReplyAndCorrections(history, userText);
+      const result = await streamReply(history, userText, (sentence) => {
+        sentences.push(sentence);
+        ttsPromises.push(synthesizeSpeech(sentence).catch(err => {
+          console.error('Lite TTS sentence failed, skipping that chunk:', err);
+          return null;
+        }));
+      });
+      replyText = result.replyText;
     } catch (aiErr) {
       console.error('Lite LLM call failed:', aiErr);
       return res.status(502).json({ error: 'Reply generation failed — please try again.' });
     }
-    console.log(`[lite timing] LLM reply done: ${elapsed()}`);
+    console.log(`[lite timing] LLM reply done: ${elapsed()}ms`);
 
-    // Defensive validation — same principle as the analysis route: never
-    // trust model output blindly even with a schema.
-    const replyText = typeof parsed.reply === 'string' ? parsed.reply.slice(0, 2000) : '';
-    const mistakes = Array.isArray(parsed.mistakes) ? parsed.mistakes.slice(0, 10).map(m => ({
-      wrong: String(m.wrong || '').slice(0, 300),
-      correct: String(m.correct || '').slice(0, 300),
-      reason: String(m.reason || '').slice(0, 300)
-    })) : [];
-
-    // 4. Text -> speech (Gemini TTS). If this fails, don't fail the whole
-    // turn — the user still gets the text + corrections, just no audio.
-    // TTS time scales with how much text it has to synthesize (measured:
-    // ~3.8-6s, the single biggest chunk of turn latency). The prompt
-    // already asks for 1-3 short sentences, but the LLM doesn't always
-    // obey — so cap what actually goes to TTS as a hard backstop. The
-    // full replyText (uncapped) still gets shown in the UI and stored;
-    // only the audio is bounded.
-    let ttsInput = replyText;
-    if (ttsInput.length > MAX_TTS_CHARS) {
-      // Cut at the last sentence boundary before the limit so audio
-      // doesn't end mid-word; falls back to a hard cut if no boundary found.
-      const cut = ttsInput.slice(0, MAX_TTS_CHARS);
-      const lastBoundary = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('? '), cut.lastIndexOf('! '));
-      ttsInput = lastBoundary > 40 ? cut.slice(0, lastBoundary + 1) : cut;
+    const audioParts = [];
+    for (let i = 0; i < ttsPromises.length; i++) {
+      const audioOut = await ttsPromises[i];
+      if (audioOut) audioParts.push(audioOut);
     }
+    console.log(`[lite timing] TTS done: ${elapsed()}ms`);
 
-    let audioOut = null;
     try {
-      audioOut = await synthesizeSpeech(ttsInput);
-    } catch (ttsErr) {
-      console.error('Lite TTS failed (continuing without audio):', ttsErr);
+      await persistTurn(session, userText, replyText);
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
     }
-    console.log(`[lite timing] TTS done: ${elapsed()}`);
+    console.log(`[lite timing] TOTAL (server-side, excludes upload/download): ${elapsed()}ms`);
 
-    // 5. Persist both turns (one bulk insert, matches the existing pattern)
-    const startIndex = session.turn_count;
-    const rows = [
-      { session_id: session.id, role: 'user', content: userText, turn_index: startIndex },
-      { session_id: session.id, role: 'assistant', content: replyText, mistakes, turn_index: startIndex + 1 }
-    ];
-    const { error: insertErr } = await supabaseAdmin.from('lite_turns').insert(rows);
-    if (insertErr) return res.status(500).json({ error: insertErr.message });
-
-    await supabaseAdmin
-      .from('lite_sessions')
-      .update({ ended_at: new Date().toISOString(), turn_count: startIndex + 2 })
-      .eq('id', session.id);
-
-    console.log(`[lite timing] TOTAL (server-side, excludes upload/download): ${elapsed()}`);
-
+    // Single response, so audio has to be one payload — concatenating
+    // sentence-level WAVs isn't valid WAV (multiple RIFF headers back to
+    // back), so this route sends only the FIRST sentence's audio plus the
+    // full text, and documents that callers who want full multi-sentence
+    // audio should use /turn/stream instead. In practice every real
+    // client uses /turn/stream now; this route exists purely as a
+    // simple fallback.
     res.json({
       user_text: userText,
       reply_text: replyText,
-      mistakes,
-      audio_base64: audioOut ? audioOut.audio_base64 : null,
-      audio_mime_type: audioOut ? audioOut.mime_type : null
+      audio_base64: audioParts[0] ? audioParts[0].audio_base64 : null,
+      audio_mime_type: audioParts[0] ? audioParts[0].mime_type : null
     });
   } catch (err) { next(err); }
 });
 
-// THE "NEGLIGIBLE LATENCY" VERSION of the core loop, same inputs/outputs
-// as POST /sessions/:id/turn, but delivered as a stream instead of one
-// big blocking JSON response. The old /turn route stays exactly as-is
-// above (nothing about it changed) — this is additive, so any client
-// still calling /turn keeps working unmodified.
+// THE "NEGLIGIBLE LATENCY" VERSION of the core loop — delivered as a
+// stream, and now TRULY pipelined end-to-end (not just TTS anymore):
 //
-// Why this is the real fix, not just another shave: in the blocking
-// version, TOTAL time = STT + LLM + TTS, all stacked, and the user sees
-// NOTHING until all three finish. Here, the user sees the reply text the
-// MOMENT the LLM is done (skips waiting for TTS entirely), and hears the
-// first sentence of audio while later sentences are still being
-// synthesized in the background. Server-side total work done is
-// basically the same — what changes is when the client gets to react to
-// each piece, which is what "feels negligible" actually means.
+//   OLD (first streaming version): wait for the ENTIRE LLM reply to
+//   finish generating -> THEN split into sentences -> THEN fire TTS for
+//   all of them in parallel. Text and audio both still gated on the
+//   full LLM generation completing.
 //
-// Wire format: standard Server-Sent-Events framing (`event: NAME\ndata:
-// JSON\n\n`) written over a plain POST response — NOT the browser
-// EventSource API (that only supports GET). The client should POST with
-// fetch() and read `response.body` with a ReadableStream reader, parsing
-// `event:`/`data:` lines itself (a few lines of code — this is a very
-// common pattern for streaming POST responses, same idea as how
-// ChatGPT-style token streaming works over fetch).
+//   NOW: the LLM call itself streams token-by-token (see llmClient.js).
+//   The INSTANT a sentence completes mid-stream, this route (a) sends
+//   that sentence's text to the client and (b) fires off its TTS
+//   synthesis — WHILE the model is still generating the next sentence.
+//   By the time the model finishes the full reply, sentence 1's audio
+//   may already be done. Nothing waits for "the whole reply" anymore;
+//   everything waits only for "the next unit that's actually needed."
+//
+// Also: no mistake/correction analysis on this path anymore (see file
+// header) — one less thing blocking the reply, and a meaningfully
+// shorter/cheaper LLM call besides.
+//
+// Wire format: Server-Sent-Events framing over a plain POST response —
+// NOT the browser EventSource API (POST isn't supported by it). Client
+// should POST with fetch() and read response.body with a stream reader.
 //
 // Events emitted, in order:
-//   user_text   { text }                                            — as soon as STT is done
-//   reply       { reply_text, mistakes }                             — as soon as the LLM is done (audio not ready yet)
-//   audio_chunk { index, total, text, audio_base64, mime_type }      — one per sentence, in order, as each finishes synthesizing
-//   done        { total_ms }                                        — everything finished + persisted, safe to close the connection
-//   error       { error }                                            — something failed; connection ends after this, no further events
+//   user_text     { text }                        — as soon as STT is done
+//   reply_sentence{ index, text }                  — one per sentence, the MOMENT the LLM finishes generating it
+//   audio_chunk   { index, audio_base64, audio_mime_type } — one per sentence, in order, as each finishes synthesizing (may lag behind reply_sentence — that's expected, TTS takes longer than generating the text)
+//   done          { total_ms }                     — everything finished + persisted, safe to close the connection
+//   error         { error }                        — something failed; connection ends after this, no further events
 router.post('/sessions/:id/turn/stream', requireAuth, async (req, res, next) => {
   const { audio_base64, mime_type } = req.body;
   if (!audio_base64 || typeof audio_base64 !== 'string') return res.status(400).json({ error: 'audio_base64 is required' });
@@ -307,104 +278,66 @@ router.post('/sessions/:id/turn/stream', requireAuth, async (req, res, next) => 
   req.on('close', () => { clientGone = true; });
 
   try {
-    const { data: session, error: sessionErr } = await supabaseAdmin
-      .from('lite_sessions')
-      .select('id, turn_count')
-      .eq('id', req.params.id)
-      .eq('user_id', req.user.id)
-      .single();
-    if (sessionErr || !session) { send('error', { error: 'Session not found' }); return res.end(); }
-
-    // Same parallel STT + history fetch as the blocking route.
-    const audioBuffer = Buffer.from(audio_base64, 'base64');
-    const historyPromise = supabaseAdmin
-      .from('lite_turns')
-      .select('role, content')
-      .eq('session_id', session.id)
-      .order('turn_index', { ascending: false })
-      .limit(MAX_TURNS_CONTEXT);
-
-    let userText, historyRows, historyErr;
+    let session, userText, history;
     try {
-      const [sttResult, historyResult] = await Promise.all([transcribeAudio(audioBuffer, mime_type), historyPromise]);
-      userText = sttResult;
-      historyRows = historyResult.data;
-      historyErr = historyResult.error;
-    } catch (sttErr) {
-      console.error('Lite STT (stream) failed:', sttErr);
-      send('error', { error: 'Transcription failed — please try again.' });
+      ({ session, userText, history } = await runSttAndHistory(req.params.id, req.user.id, Buffer.from(audio_base64, 'base64'), mime_type));
+    } catch (e) {
+      send('error', { error: e.message });
       return res.end();
     }
     if (clientGone) return res.end();
-    if (!userText) { send('error', { error: 'Could not hear any speech — try again a bit louder/closer to mic.' }); return res.end(); }
-    if (historyErr) { send('error', { error: historyErr.message }); return res.end(); }
-    const history = (historyRows || []).reverse();
     send('user_text', { text: userText });
     console.log(`[lite timing/stream] STT + history done: ${elapsed()}ms`);
 
-    // Text reply — client already sees the user's own transcribed text;
-    // now they get the reply too, WITHOUT waiting for any audio.
-    let parsed;
+    // Fired synchronously from inside streamReply's token loop, so this
+    // must NOT be awaited there — it just sends the text event and
+    // pushes a TTS promise onto the queue, then returns immediately so
+    // the LLM stream keeps being read without stalling on network I/O.
+    const ttsPromises = [];
+    let sentenceCount = 0;
+    const onSentence = (sentence, index) => {
+      if (clientGone) return;
+      send('reply_sentence', { index, text: sentence });
+      ttsPromises.push(
+        synthesizeSpeech(sentence).catch(err => {
+          console.error('Lite TTS (stream) sentence failed, skipping that chunk:', err);
+          return null;
+        })
+      );
+      sentenceCount = index + 1;
+    };
+
+    let replyText;
     try {
-      parsed = await getReplyAndCorrections(history, userText);
+      const result = await streamReply(history, userText, onSentence);
+      replyText = result.replyText;
     } catch (aiErr) {
       console.error('Lite LLM (stream) failed:', aiErr);
       send('error', { error: 'Reply generation failed — please try again.' });
       return res.end();
     }
     if (clientGone) return res.end();
+    console.log(`[lite timing/stream] LLM stream done, ${sentenceCount} sentence(s): ${elapsed()}ms`);
 
-    const replyText = typeof parsed.reply === 'string' ? parsed.reply.slice(0, 2000) : '';
-    const mistakes = Array.isArray(parsed.mistakes) ? parsed.mistakes.slice(0, 10).map(m => ({
-      wrong: String(m.wrong || '').slice(0, 300),
-      correct: String(m.correct || '').slice(0, 300),
-      reason: String(m.reason || '').slice(0, 300)
-    })) : [];
-
-    send('reply', { reply_text: replyText, mistakes });
-    console.log(`[lite timing/stream] LLM reply done (text sent): ${elapsed()}ms`);
-
-    // Pipelined TTS: fire off every sentence's synthesis in parallel right
-    // away (so total wall-clock time is bounded by the slowest sentence,
-    // not the sum of all of them), then emit them to the client strictly
-    // in order so playback never jumbles sentence 2 before sentence 1 —
-    // even if sentence 2 happens to come back from Sarvam first.
-    const sentences = capTextForTts(replyText);
-    const ttsPromises = sentences.map(s =>
-      synthesizeSpeech(s).catch(err => {
-        console.error('Lite TTS (stream) sentence failed, skipping that chunk:', err);
-        return null;
-      })
-    );
-    for (let i = 0; i < sentences.length; i++) {
+    // TTS calls were already fired as each sentence completed above —
+    // this just waits for them and emits in order, so playback never
+    // jumbles sentence 2 before sentence 1 even if sentence 2's TTS
+    // happens to finish first (e.g. it was shorter).
+    for (let i = 0; i < ttsPromises.length; i++) {
       const audioOut = await ttsPromises[i];
       if (clientGone) return res.end();
       if (audioOut) {
-        send('audio_chunk', {
-          index: i,
-          total: sentences.length,
-          text: sentences[i],
-          audio_base64: audioOut.audio_base64,
-          audio_mime_type: audioOut.mime_type
-        });
+        send('audio_chunk', { index: i, audio_base64: audioOut.audio_base64, audio_mime_type: audioOut.mime_type });
       }
     }
     console.log(`[lite timing/stream] all audio chunks done: ${elapsed()}ms`);
 
-    // Persist exactly like the blocking route — happens after streaming
-    // so a slow/failed DB write never delays what the user hears.
-    const startIndex = session.turn_count;
-    const rows = [
-      { session_id: session.id, role: 'user', content: userText, turn_index: startIndex },
-      { session_id: session.id, role: 'assistant', content: replyText, mistakes, turn_index: startIndex + 1 }
-    ];
-    const { error: insertErr } = await supabaseAdmin.from('lite_turns').insert(rows);
-    if (insertErr) { send('error', { error: insertErr.message }); return res.end(); }
-
-    await supabaseAdmin
-      .from('lite_sessions')
-      .update({ ended_at: new Date().toISOString(), turn_count: startIndex + 2 })
-      .eq('id', session.id);
+    try {
+      await persistTurn(session, userText, replyText);
+    } catch (e) {
+      send('error', { error: e.message });
+      return res.end();
+    }
 
     console.log(`[lite timing/stream] TOTAL (server-side): ${elapsed()}ms`);
     send('done', { total_ms: elapsed() });
