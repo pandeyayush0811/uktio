@@ -18,7 +18,7 @@ const { requireAuth } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../lib/supabaseClient');
 const { transcribeAudio } = require('../lib/lite/sarvamSttClient');
 const { streamReply } = require('../lib/lite/llmClient');
-const { synthesizeSpeech } = require('../lib/lite/sarvamTtsClient');
+const { synthesize } = require('../lib/lite/sarvamTtsClient');
 
 // How many past turns get fed back as context on each new turn — kept
 // deliberately small. This is a quick-practice chat, not a long-term
@@ -184,7 +184,7 @@ router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
     try {
       const result = await streamReply(history, userText, (sentence, lang) => {
         sentences.push(sentence);
-        ttsPromises.push(synthesizeSpeech(sentence, lang).catch(err => {
+        ttsPromises.push(synthesize(sentence, lang).catch(err => {
           console.error('Lite TTS sentence failed, skipping that chunk:', err);
           return null;
         }));
@@ -305,7 +305,7 @@ router.post('/sessions/:id/turn/stream', requireAuth, async (req, res, next) => 
       if (clientGone) return;
       send('reply_sentence', { index, text: sentence });
       ttsPromises.push(
-        synthesizeSpeech(sentence, lang).catch(err => {
+        synthesize(sentence, lang).catch(err => {
           console.error('Lite TTS (stream) sentence failed, skipping that chunk:', err);
           return null;
         })

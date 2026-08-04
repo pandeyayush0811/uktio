@@ -1,7 +1,7 @@
 {
   "name": "uktio-backend",
   "version": "1.0.0",
-  "description": "Uktio backend — auth + profile only. Voice traffic (BYOK) goes device-to-Gemini directly, never through this server.",
+  "description": "Uktio backend \u2014 auth + profile only. Voice traffic (BYOK) goes device-to-Gemini directly, never through this server.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -16,6 +16,7 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
     "morgan": "^1.10.0",
-    "openai": "^4.79.0"
+    "openai": "^4.79.0",
+    "ws": "^8.18.0"
   }
 }
