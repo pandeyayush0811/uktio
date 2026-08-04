@@ -94,6 +94,14 @@ router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
     if (!audio_base64 || typeof audio_base64 !== 'string') return res.status(400).json({ error: 'audio_base64 is required' });
     if (!mime_type || typeof mime_type !== 'string') return res.status(400).json({ error: 'mime_type is required' });
 
+    // TEMP TIMING INSTRUMENTATION — remove once we've identified the
+    // slow stage. Logs elapsed ms at each step so we can see exactly
+    // where the turn's time is going (network upload isn't included
+    // here — that happens before Express even sees the request — so
+    // compare this server-side total against what the client perceives).
+    const t0 = Date.now();
+    const elapsed = () => `${Date.now() - t0}ms`;
+
     const { data: session, error: sessionErr } = await supabaseAdmin
       .from('lite_sessions')
       .select('id, turn_count')
@@ -101,8 +109,9 @@ router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
       .eq('user_id', req.user.id)
       .single();
     if (sessionErr || !session) return res.status(404).json({ error: 'Session not found' });
+    console.log(`[lite timing] session lookup done: ${elapsed()}`);
 
-    // 1. Speech -> text (Groq Whisper)
+    // 1. Speech -> text (Gemini)
     const audioBuffer = Buffer.from(audio_base64, 'base64');
     let userText;
     try {
@@ -111,6 +120,7 @@ router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
       console.error('Lite STT failed:', sttErr);
       return res.status(502).json({ error: 'Transcription failed — please try again.' });
     }
+    console.log(`[lite timing] STT done: ${elapsed()}`);
     if (!userText) return res.status(422).json({ error: 'Could not hear any speech — try again a bit louder/closer to mic.' });
 
     // 2. Pull recent context so the reply isn't stateless
@@ -122,6 +132,7 @@ router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
       .limit(MAX_TURNS_CONTEXT);
     if (historyErr) return res.status(500).json({ error: historyErr.message });
     const history = (historyRows || []).reverse();
+    console.log(`[lite timing] history fetch done: ${elapsed()}`);
 
     // 3. Text reply + inline correction (OpenAI GPT-4.1)
     let parsed;
@@ -131,6 +142,7 @@ router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
       console.error('Lite LLM call failed:', aiErr);
       return res.status(502).json({ error: 'Reply generation failed — please try again.' });
     }
+    console.log(`[lite timing] LLM reply done: ${elapsed()}`);
 
     // Defensive validation — same principle as the analysis route: never
     // trust model output blindly even with a schema.
@@ -149,6 +161,7 @@ router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
     } catch (ttsErr) {
       console.error('Lite TTS failed (continuing without audio):', ttsErr);
     }
+    console.log(`[lite timing] TTS done: ${elapsed()}`);
 
     // 5. Persist both turns (one bulk insert, matches the existing pattern)
     const startIndex = session.turn_count;
@@ -163,6 +176,8 @@ router.post('/sessions/:id/turn', requireAuth, async (req, res, next) => {
       .from('lite_sessions')
       .update({ ended_at: new Date().toISOString(), turn_count: startIndex + 2 })
       .eq('id', session.id);
+
+    console.log(`[lite timing] TOTAL (server-side, excludes upload/download): ${elapsed()}`);
 
     res.json({
       user_text: userText,
