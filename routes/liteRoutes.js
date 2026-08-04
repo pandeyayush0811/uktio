@@ -295,21 +295,48 @@ router.post('/sessions/:id/turn/stream', requireAuth, async (req, res, next) => 
     send('user_text', { text: userText });
     console.log(`[lite timing/stream] STT + history done: ${elapsed()}ms`);
 
+    // audioResults + nextAudioIndexToSend: TTS promises are kicked off
+    // the instant each sentence's text is ready (in onSentence, below),
+    // but they don't all resolve in order — sentence 2's TTS might finish
+    // before sentence 1's. This little queue lets each promise send its
+    // audio_chunk THE MOMENT IT RESOLVES, while still guaranteeing they
+    // reach the client in order (index 0 before index 1, etc.) — a
+    // resolved-out-of-order result just waits in the map until its turn
+    // comes up. This is what makes audio genuinely progressive: sentence
+    // 1's audio can reach the client while the LLM is still generating
+    // sentence 4, instead of everything arriving in one burst at the end.
+    const audioResults = new Map(); // index -> {audio_base64, mime_type} | null
+    let nextAudioIndexToSend = 0;
+    function flushAudioQueue() {
+      while (audioResults.has(nextAudioIndexToSend)) {
+        const result = audioResults.get(nextAudioIndexToSend);
+        audioResults.delete(nextAudioIndexToSend);
+        if (result && !clientGone) {
+          send('audio_chunk', { index: nextAudioIndexToSend, audio_base64: result.audio_base64, audio_mime_type: result.mime_type });
+        }
+        nextAudioIndexToSend++;
+      }
+    }
+
     // Fired synchronously from inside streamReply's token loop, so this
-    // must NOT be awaited there — it just sends the text event and
-    // pushes a TTS promise onto the queue, then returns immediately so
-    // the LLM stream keeps being read without stalling on network I/O.
+    // must NOT be awaited there — it just sends the text event and kicks
+    // off TTS, then returns immediately so the LLM stream keeps being
+    // read without stalling on network I/O. The TTS promise's own .then
+    // is what actually sends the audio, whenever it happens to resolve —
+    // could be during this same LLM stream, could be after.
     const ttsPromises = [];
     let sentenceCount = 0;
     const onSentence = (sentence, lang, index) => {
       if (clientGone) return;
       send('reply_sentence', { index, text: sentence });
-      ttsPromises.push(
-        synthesize(sentence, lang).catch(err => {
+      const p = synthesize(sentence, lang)
+        .then(audioOut => { audioResults.set(index, audioOut); flushAudioQueue(); })
+        .catch(err => {
           console.error('Lite TTS (stream) sentence failed, skipping that chunk:', err);
-          return null;
-        })
-      );
+          audioResults.set(index, null);
+          flushAudioQueue();
+        });
+      ttsPromises.push(p);
       sentenceCount = index + 1;
     };
 
@@ -325,17 +352,12 @@ router.post('/sessions/:id/turn/stream', requireAuth, async (req, res, next) => 
     if (clientGone) return res.end();
     console.log(`[lite timing/stream] LLM stream done, ${sentenceCount} sentence(s): ${elapsed()}ms`);
 
-    // TTS calls were already fired as each sentence completed above —
-    // this just waits for them and emits in order, so playback never
-    // jumbles sentence 2 before sentence 1 even if sentence 2's TTS
-    // happens to finish first (e.g. it was shorter).
-    for (let i = 0; i < ttsPromises.length; i++) {
-      const audioOut = await ttsPromises[i];
-      if (clientGone) return res.end();
-      if (audioOut) {
-        send('audio_chunk', { index: i, audio_base64: audioOut.audio_base64, audio_mime_type: audioOut.mime_type });
-      }
-    }
+    // By now most/all audio has likely already streamed out via the
+    // .then() handlers above (that's the whole point) — this just waits
+    // for any still in flight so we don't persist/close before everything
+    // the client needs has actually been sent.
+    await Promise.all(ttsPromises);
+    if (clientGone) return res.end();
     console.log(`[lite timing/stream] all audio chunks done: ${elapsed()}ms`);
 
     // Deliberately still AWAITED, not fire-and-forget, even though this

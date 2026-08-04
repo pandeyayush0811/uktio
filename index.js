@@ -38,6 +38,16 @@ const chatRoutes = require('./routes/chatRoutes');
 const liteRoutes = require('./routes/liteRoutes');
 
 const app = express();
+// Render (and most PaaS hosts) sit in front of this app as a reverse
+// proxy, adding an X-Forwarded-For header with the real client IP.
+// Without this, Express doesn't trust that header (correctly, by
+// default — trusting it blindly would let a client fake their own IP
+// on a setup with no proxy in front). Since we know there's exactly one
+// trusted proxy hop (Render's edge), `1` tells express-rate-limit to use
+// the IP one hop back from itself, i.e. the real client — not the
+// proxy's own IP for every single request. Was previously throwing an
+// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR warning on every request.
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '5mb' })); // was: app.use(express.json());
 app.use(morgan('combined'));
