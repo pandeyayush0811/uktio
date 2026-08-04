@@ -3,10 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 
-const liteRoutes = require('./routes/liteRoutes');
-// ...
-app.use('/lite', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), liteRoutes);
-
 // Fail fast with a clear message instead of a confusing crash later.
 const requiredEnv = ['SUPABASE_URL', 'SUPABASE_ANON_KEY'];
 for (const key of requiredEnv) {
@@ -39,6 +35,7 @@ const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const chatRoutes = require('./routes/chatRoutes');
+const liteRoutes = require('./routes/liteRoutes');
 
 const app = express();
 app.use(cors());
@@ -53,6 +50,7 @@ app.use('/auth', authLimiter, authRoutes);
 // /chat/sessions) stay under the general limiter only.
 app.use('/users', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), userRoutes);
 app.use('/chat', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), chatRoutes);
+app.use('/lite', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), liteRoutes);
 
 app.use(notFoundHandler);
 if (process.env.SENTRY_DSN) Sentry.setupExpressErrorHandler(app); // reports to Sentry, then falls through
