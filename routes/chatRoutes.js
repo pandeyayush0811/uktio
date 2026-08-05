@@ -202,9 +202,40 @@ const ANALYSIS_SCHEMA = {
       }
     },
     growth_note: { type: 'string' },
-    focus_next: { type: 'string' }
+    focus_next: { type: 'string' },
+    // 1-10 — a single glanceable number for the top of the report /
+    // share card. Keeps the report from being 100% text.
+    confidence_score: { type: 'integer' },
+    // Turn-immediately-after-session quiz, generated in the SAME call so
+    // it's grounded in this session's actual mistakes — no extra LLM
+    // round trip. Every question object carries all possible fields;
+    // irrelevant ones are "" / [] / false for that question's type (kept
+    // flat on purpose — strict structured-output schemas don't handle
+    // polymorphic/union shapes well).
+    quiz: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          // yes_no: judge if `sentence` is correct (swipe right/left).
+          // choose_3: pick the correct one of 3 `options`.
+          // hindi_to_english: `hindi` shown, pick correct of 3 `options`.
+          // speak: user must SPEAK `expected_answer` out loud.
+          type: { type: 'string', enum: ['yes_no', 'choose_3', 'hindi_to_english', 'speak'] },
+          prompt: { type: 'string' }, // the instruction line shown above the card
+          sentence: { type: 'string' }, // yes_no: the English sentence to judge
+          hindi: { type: 'string' }, // hindi_to_english / speak: the Hindi thought
+          options: { type: 'array', items: { type: 'string' } }, // choose_3 / hindi_to_english: exactly 3
+          correct_option: { type: 'string' }, // choose_3 / hindi_to_english: must exactly match one option
+          is_correct: { type: 'boolean' }, // yes_no: whether `sentence` is actually correct
+          expected_answer: { type: 'string' } // speak: the correct English the user should say
+        },
+        required: ['type', 'prompt', 'sentence', 'hindi', 'options', 'correct_option', 'is_correct', 'expected_answer'],
+        additionalProperties: false
+      }
+    }
   },
-  required: ['opening_line', 'strengths', 'mistakes', 'growth_note', 'focus_next'],
+  required: ['opening_line', 'strengths', 'mistakes', 'growth_note', 'focus_next', 'confidence_score', 'quiz'],
   additionalProperties: false
 };
 
@@ -244,7 +275,9 @@ async function getAnalysisPrompt() {
 
 // Columns for the new report shape — kept in one place so the idempotent
 // fast-path and the GET route can't drift apart.
-const REPORT_COLUMNS = 'id, session_id, opening_line, strengths, mistakes, growth_note, focus_next, generated_at';
+const REPORT_COLUMNS = 'id, session_id, opening_line, strengths, mistakes, growth_note, focus_next, confidence_score, quiz, generated_at';
+
+const QUIZ_TYPES = new Set(['yes_no', 'choose_3', 'hindi_to_english', 'speak']);
 
 // Returns the existing report for a session, if one has been generated.
 // 404 (not 200 with null) if none exists — the frontend uses this to
@@ -362,6 +395,19 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
       })) : [],
       growth_note: typeof parsed.growth_note === 'string' ? parsed.growth_note.slice(0, 1000) : '',
       focus_next: typeof parsed.focus_next === 'string' ? parsed.focus_next.slice(0, 1000) : '',
+      confidence_score: Number.isInteger(parsed.confidence_score)
+        ? Math.min(10, Math.max(1, parsed.confidence_score))
+        : 5,
+      quiz: Array.isArray(parsed.quiz) ? parsed.quiz.slice(0, 10).map(q => ({
+        type: QUIZ_TYPES.has(q.type) ? q.type : 'yes_no',
+        prompt: String(q.prompt || '').slice(0, 300),
+        sentence: String(q.sentence || '').slice(0, 300),
+        hindi: String(q.hindi || '').slice(0, 300),
+        options: Array.isArray(q.options) ? q.options.slice(0, 3).map(o => String(o).slice(0, 200)) : [],
+        correct_option: String(q.correct_option || '').slice(0, 200),
+        is_correct: typeof q.is_correct === 'boolean' ? q.is_correct : false,
+        expected_answer: String(q.expected_answer || '').slice(0, 300)
+      })) : [],
       model_version: model,
       raw_response: parsed
     };
