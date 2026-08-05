@@ -387,7 +387,7 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
         occurred_count: Number.isInteger(m.occurred_count) && m.occurred_count >= 0 ? m.occurred_count : 1,
         context: String(m.context || '').slice(0, 1000),
         reason: String(m.reason || '').slice(0, 500),
-        examples: Array.isArray(m.examples) ? m.examples.slice(0, 3).map(e => ({
+        examples: Array.isArray(m.examples) ? m.examples.slice(0, 6).map(e => ({
           hindi: String(e.hindi || '').slice(0, 400),
           wrong_english: String(e.wrong_english || '').slice(0, 400),
           correct_english: String(e.correct_english || '').slice(0, 400)
