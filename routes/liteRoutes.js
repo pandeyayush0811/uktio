@@ -15,10 +15,11 @@
 const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
-const { supabaseAdmin } = require('../lib/supabaseClient');
+const { supabaseAdmin, supabaseAnon } = require('../lib/supabaseClient');
 const { transcribeAudio } = require('../lib/lite/sarvamSttClient');
 const { streamReply } = require('../lib/lite/llmClient');
-const { synthesize } = require('../lib/lite/sarvamTtsClient');
+const { synthesize, LiveTtsSession } = require('../lib/lite/sarvamTtsClient');
+const { LiveSttSession } = require('../lib/lite/sarvamSttStreamClient');
 
 // How many past turns get fed back as context on each new turn — kept
 // deliberately small. This is a quick-practice chat, not a long-term
@@ -392,4 +393,259 @@ router.post('/sessions/:id/turn/stream', requireAuth, async (req, res, next) => 
   }
 });
 
+// ============================================================
+// LIVE (WebSocket) TURN HANDLER — the "negligible latency" version
+// ============================================================
+// Everything above this point (POST /turn and POST /turn/stream) is
+// untouched — this is a NEW, separate path, not a replacement, so the
+// old routes remain a safe fallback while this gets validated live.
+//
+// Fixes, vs. the REST/SSE routes above:
+//   - Audio streams to Sarvam's STT WebSocket AS THE USER TALKS (see
+//     sarvamSttStreamClient.js), instead of buffering the whole
+//     recording client-side and uploading it as one blob after the user
+//     stops. By the time the user finishes speaking, transcription is
+//     usually already mostly/fully done.
+//   - TTS reuses ONE WebSocket connection across the whole turn (see
+//     LiveTtsSession in sarvamTtsClient.js) instead of paying a fresh
+//     TCP+TLS handshake per sentence.
+//
+// Wire protocol (JSON text frames both directions):
+//   Client -> Server:
+//     { type: 'audio_chunk', data: '<base64 raw PCM, 16kHz mono>' }  — sent repeatedly while recording
+//     { type: 'stop' }                                                — user ended their turn (manual, authoritative in v1 — see note below)
+//   Server -> Client:
+//     { type: 'ready' }
+//     { type: 'user_text', text }
+//     { type: 'reply_sentence', index, text }
+//     { type: 'audio_chunk', index, audio_base64, audio_mime_type }
+//     { type: 'done', total_ms }
+//     { type: 'error', error }
+//
+// NOTE ON END-OF-TURN DETECTION: Sarvam's STT WebSocket can emit
+// speech_start/speech_end VAD events (see sarvamSttStreamClient.js), and
+// the doc guide this was built from suggested using that to auto-end the
+// turn with no manual tap needed. That part is DELIBERATELY NOT wired up
+// here yet — VAD auto-cutoff changes the app's UX (users get cut off if
+// the silence threshold isn't tuned right for real devices/networks) and
+// can't be safely tuned or tested from this environment. `speech_end`
+// still fires and is logged/available on the session object if you want
+// to experiment with it, but the manual 'stop' message remains the
+// authoritative turn-end trigger for now — same UX the app already has,
+// just with the upload+STT latency already gone.
+//
+// Auth: WS handshakes from browsers can't set an Authorization header,
+// so the access token comes via a query param instead:
+//   wss://.../lite/sessions/:id/live?token=<supabase-access-token>
+// verifyWsAuth() below wraps the Supabase call in try/catch specifically
+// because an unhandled rejection from an awaited async call can crash
+// the whole Node process on Node 15+ — this is the same underlying
+// supabaseAnon.auth.getUser() call requireAuth() uses for the REST
+// routes, just wrapped defensively here since this is new code on a new
+// path. (Worth applying the same wrap to middleware/authMiddleware.js
+// itself at some point — that file's outside lite/'s scope so it hasn't
+// been touched here.)
+async function verifyWsAuth(token) {
+  if (!token) return null;
+  try {
+    const { data, error } = await supabaseAnon.auth.getUser(token);
+    if (error || !data.user) return null;
+    return data.user;
+  } catch (err) {
+    console.error('WS auth check threw unexpectedly:', err);
+    return null;
+  }
+}
+
+// One call per open WebSocket connection. `ws` is a `ws` package socket
+// already accepted by the upgrade handler in index.js; `sessionRowId` and
+// `userId` have already been resolved/verified by the caller.
+async function handleLiveTurn(ws, sessionRowId, userId) {
+  const t0 = Date.now();
+  const elapsed = () => Date.now() - t0;
+  const send = (type, payload) => {
+    if (ws.readyState !== ws.OPEN) return;
+    try { ws.send(JSON.stringify({ type, ...payload })); } catch (_) { /* socket likely closing */ }
+  };
+
+  if (!supabaseAdmin) { send('error', { error: 'Server misconfigured.' }); ws.close(1011); return; }
+
+  let session;
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('lite_sessions')
+      .select('id, turn_count')
+      .eq('id', sessionRowId)
+      .eq('user_id', userId)
+      .single();
+    if (error || !data) { send('error', { error: 'Session not found' }); ws.close(1008); return; }
+    session = data;
+  } catch (err) {
+    console.error('Live turn: session lookup failed:', err);
+    send('error', { error: 'Server error looking up session.' });
+    ws.close(1011);
+    return;
+  }
+
+  // History fetch starts immediately, in parallel with the STT session —
+  // same principle as runSttAndHistory() above, neither depends on the
+  // other.
+  const historyPromise = supabaseAdmin
+    .from('lite_turns')
+    .select('role, content')
+    .eq('session_id', session.id)
+    .order('turn_index', { ascending: false })
+    .limit(MAX_TURNS_CONTEXT)
+    .then(r => ({ ...r, data: (r.data || []).reverse() }));
+
+  const stt = new LiveSttSession({}); // no fixed languageCode — let Sarvam auto-detect per turn
+  let sttReady = false;
+  try {
+    await stt.connect();
+    sttReady = true;
+  } catch (err) {
+    console.error('Live turn: STT WebSocket connect failed:', err);
+    send('error', { error: 'Could not start live transcription — please try again.' });
+    ws.close(1011);
+    return;
+  }
+  send('ready', {});
+  console.log(`[lite timing/live] STT session ready: ${elapsed()}ms`);
+
+  let clientGone = false;
+  let stopReceived = false;
+  const ttsSession = new LiveTtsSession();
+  // Fire the TTS pool's first connection immediately, in parallel with
+  // the rest of turn setup — see LiveTtsSession.prewarm()'s comment.
+  // Best-effort, never awaited: if the guess is wrong or it fails, the
+  // first real speak() call just reconnects as it always did.
+  ttsSession.prewarm('en-IN'); // most turns open in English; wrong guess just costs a reconnect, not a delay
+
+  ws.on('close', () => {
+    clientGone = true;
+    stt.abort();
+    ttsSession.close();
+  });
+
+  stt.on('error', (err) => {
+    console.error('Live turn: STT session error:', err);
+    if (!clientGone && !stopReceived) send('error', { error: 'Transcription connection failed — please try again.' });
+  });
+
+  // Kept for future use (see the note above on VAD auto-endpointing) —
+  // not wired to anything yet, just observable via logs today.
+  stt.on('speechStart', () => console.log('[lite live] speech_start'));
+  stt.on('speechEnd', () => console.log('[lite live] speech_end'));
+
+  ws.on('message', (raw) => {
+    if (stopReceived) return; // ignore stray audio after stop
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch (_) { return; }
+
+    if (msg.type === 'audio_chunk' && typeof msg.data === 'string') {
+      try {
+        stt.pushAudioChunk(Buffer.from(msg.data, 'base64'));
+      } catch (err) {
+        console.error('Live turn: failed to push audio chunk:', err);
+      }
+    } else if (msg.type === 'stop') {
+      stopReceived = true;
+      runTurn().catch(err => {
+        console.error('Live turn: unexpected failure:', err);
+        if (!clientGone) { send('error', { error: 'Unexpected server error — please try again.' }); try { ws.close(1011); } catch (_) {} }
+      });
+    }
+  });
+
+  async function runTurn() {
+    // DEBUG TIMING LOG — prints user text, every LLM sentence, and every
+    // TTS audio chunk, each tagged with a wall-clock timestamp AND
+    // elapsed-since-turn-start ms, so a full turn's timeline can be read
+    // straight off the server logs. `turnId` ties every line from this
+    // turn together when multiple turns/sockets are logging concurrently.
+    const turnId = `${sessionRowId}-${t0}`;
+    const ts = () => new Date().toISOString();
+    const log = (label, extra) => {
+      console.log(`[lite live][${turnId}] t=+${elapsed()}ms @${ts()} — ${label}${extra !== undefined ? ': ' + extra : ''}`);
+    };
+
+    log('turn started (stop received, finishing STT)');
+    const userText = (await stt.finish()).trim();
+    log('USER TEXT (final STT)', JSON.stringify(userText));
+
+    const historyResult = await historyPromise;
+    if (historyResult.error) { send('error', { error: historyResult.error.message }); return ws.close(1011); }
+    const history = historyResult.data;
+
+    if (!userText) {
+      log('no speech detected — aborting turn');
+      send('error', { error: 'Could not hear any speech — try again a bit louder/closer to mic.' });
+      return ws.close(1000);
+    }
+    if (clientGone) return;
+    send('user_text', { text: userText });
+
+    const ttsPromises = [];
+    let sentenceCount = 0;
+    const onSentence = (sentence, lang, index) => {
+      if (clientGone) return;
+      log(`LLM SENTENCE #${index} (${lang})`, JSON.stringify(sentence));
+      send('reply_sentence', { index, text: sentence });
+      const ttsStartedAt = elapsed();
+      const p = ttsSession.speak(sentence, lang)
+        .catch(err => {
+          console.warn(`Live TTS session failed for sentence ${index} (${err.message}), falling back to REST.`);
+          return synthesize(sentence, lang).catch(err2 => {
+            console.error('Live turn: REST TTS fallback also failed, skipping that chunk:', err2);
+            return null;
+          });
+        })
+        .then(audioOut => {
+          if (audioOut) {
+            const bytes = Math.round((audioOut.audio_base64 || '').length * 0.75); // rough base64->bytes size, just for the log
+            log(`AUDIO #${index} ready (took ${elapsed() - ttsStartedAt}ms to synthesize, ~${bytes} bytes)`);
+            send('audio_chunk', { index, audio_base64: audioOut.audio_base64, audio_mime_type: audioOut.mime_type });
+          } else {
+            log(`AUDIO #${index} FAILED — no audio produced, sentence will play silent`);
+          }
+        });
+      ttsPromises.push(p);
+      sentenceCount = index + 1;
+    };
+
+    let replyText;
+    try {
+      const result = await streamReply(history, userText, onSentence);
+      replyText = result.replyText;
+    } catch (aiErr) {
+      log('LLM CALL FAILED', aiErr.message);
+      console.error('Live turn: LLM call failed:', aiErr);
+      send('error', { error: 'Reply generation failed — please try again.' });
+      return ws.close(1011);
+    }
+    log(`LLM FULL REPLY (${sentenceCount} sentence(s))`, JSON.stringify(replyText));
+    console.log(`[lite timing/live] LLM stream done, ${sentenceCount} sentence(s): ${elapsed()}ms`);
+
+    await Promise.all(ttsPromises);
+    if (clientGone) return;
+    log('ALL AUDIO CHUNKS DONE');
+    console.log(`[lite timing/live] all audio chunks done: ${elapsed()}ms`);
+
+    try {
+      await persistTurn(session, userText, replyText);
+    } catch (e) {
+      send('error', { error: e.message });
+      return ws.close(1011);
+    }
+
+    log('TURN COMPLETE');
+    console.log(`[lite timing/live] TOTAL: ${elapsed()}ms`);
+    send('done', { total_ms: elapsed() });
+    ttsSession.close();
+    try { ws.close(1000); } catch (_) { /* already closing */ }
+  }
+}
+
 module.exports = router;
+module.exports.handleLiveTurn = handleLiveTurn;
+module.exports.verifyWsAuth = verifyWsAuth;

@@ -73,7 +73,19 @@ router.get('/sessions/:id', requireAuth, async (req, res, next) => {
 
     if (messagesErr) return res.status(500).json({ error: messagesErr.message });
 
-    res.json({ session, messages });
+    // has_report: same lookup History's list view does (see GET /sessions
+    // above) — needed here too now so chat.html can (a) offer the report
+    // link inline instead of forcing a trip through History, and (b) know
+    // to lock this session against further messages (see the resume-mode
+    // check in POST /sessions below — this is what that lock enforces).
+    const { data: reportRow } = await supabaseAdmin
+      .from('session_reports')
+      .select('id')
+      .eq('session_id', id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+
+    res.json({ session, messages, has_report: !!reportRow });
   } catch (err) { next(err); }
 });
 
@@ -104,6 +116,23 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
         .single();
 
       if (existErr || !existing) return res.status(404).json({ error: 'Session to resume was not found' });
+
+      // Locked once a report exists: a report is an analysis of the
+      // conversation as it stood at generation time, and this app's design
+      // is that it stays that fixed snapshot — adding more turns after the
+      // fact would silently make the report stale/wrong with no re-analysis
+      // to match. Enforced here (not just hidden in the UI) so this can't
+      // be bypassed by an old cached page, a retried pending sync, or a
+      // direct API call.
+      const { data: reportRow } = await supabaseAdmin
+        .from('session_reports')
+        .select('id')
+        .eq('session_id', session_id)
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+      if (reportRow) {
+        return res.status(409).json({ error: 'locked', message: 'Iss chat ka report ban chuka hai — ab isme naye messages nahi jud sakte. Naya chat shuru karo.' });
+      }
 
       const startIndex = existing.turn_count;
       const rows = messages.map((m, i) => ({

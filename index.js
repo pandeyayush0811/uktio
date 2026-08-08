@@ -3,6 +3,18 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 
+// Safety net: an awaited async call that rejects without a surrounding
+// try/catch becomes an "unhandled rejection" — on Node 15+ that CRASHES
+// the whole process by default, taking down every in-flight request
+// (including unrelated ones), not just the one that failed. Individual
+// routes/handlers should still catch their own errors properly (see
+// verifyWsAuth in liteRoutes.js for one example) — this is only the last
+// resort backstop so a missed case degrades to a logged error instead of
+// a full outage + Render restart loop.
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED PROMISE REJECTION (recovered, not crashing):', reason);
+});
+
 // Fail fast with a clear message instead of a confusing crash later.
 const requiredEnv = ['SUPABASE_URL', 'SUPABASE_ANON_KEY'];
 for (const key of requiredEnv) {
@@ -66,5 +78,41 @@ app.use(notFoundHandler);
 if (process.env.SENTRY_DSN) Sentry.setupExpressErrorHandler(app); // reports to Sentry, then falls through
 app.use(errorHandler); // still sends the JSON response to the client either way
 
+const http = require('http');
+const { WebSocketServer } = require('ws');
+const { handleLiveTurn, verifyWsAuth } = require('./routes/liteRoutes');
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Uktio backend listening on port ${PORT}`));
+const server = http.createServer(app);
+
+// Manual WebSocket upgrade handling, scoped to exactly one path — every
+// other route on this server is untouched, still plain HTTP through
+// Express as before. noServer:true means this WSS instance does nothing
+// on its own; we decide per-request whether to hand the upgrade to it.
+const liteLiveWss = new WebSocketServer({ noServer: true });
+const LIVE_TURN_PATH_RE = /^\/lite\/sessions\/([^/]+)\/live$/;
+
+server.on('upgrade', async (req, socket, head) => {
+  let url;
+  try { url = new URL(req.url, `http://${req.headers.host}`); } catch (_) { socket.destroy(); return; }
+
+  const match = LIVE_TURN_PATH_RE.exec(url.pathname);
+  if (!match) { socket.destroy(); return; } // not our path — nothing else uses WS today, so just refuse
+
+  const sessionId = match[1];
+  const token = url.searchParams.get('token');
+  const user = await verifyWsAuth(token).catch((err) => {
+    console.error('WS upgrade auth check threw unexpectedly:', err);
+    return null;
+  });
+  if (!user) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
+
+  liteLiveWss.handleUpgrade(req, socket, head, (ws) => {
+    handleLiveTurn(ws, sessionId, user.id).catch((err) => {
+      console.error('handleLiveTurn crashed unexpectedly:', err);
+      try { ws.close(1011); } catch (_) { /* already gone */ }
+    });
+  });
+});
+
+server.listen(PORT, () => console.log(`Uktio backend listening on port ${PORT}`));
